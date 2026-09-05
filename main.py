@@ -48,3 +48,13 @@ def check_and_register_trial(request: TrialCheckRequest):
         "allowed": True,
         "message": "Trial granted successfully."
     }
+    from fastapi import File, UploadFile, Response
+
+@app.post("/convert")
+async def convert_invoice(file: UploadFile = File(...)):
+    content = await file.read()
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=converted_{file.filename}"}
+    )
