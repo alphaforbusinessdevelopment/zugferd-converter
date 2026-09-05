@@ -3,7 +3,7 @@ import io
 import hashlib
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header
 from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
@@ -18,6 +18,7 @@ app = FastAPI(
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
+MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -27,7 +28,6 @@ class TrialCheckRequest(BaseModel):
     vat_id: str
 
 def hash_vat_id(vat_id: str) -> str:
-    """تشفير الرقم الضريبي باستخدام SHA-256 و Salt"""
     clean_vat = vat_id.strip().upper()
     salted_string = f"{clean_vat}:{HASH_SALT}"
     return hashlib.sha256(salted_string.encode('utf-8')).hexdigest()
@@ -39,7 +39,6 @@ def generate_dynamic_zugferd_xml(
     seller_name: str = "Supplier Company",
     buyer_name: str = "Client Company"
 ) -> bytes:
-    """توليد مخرجات XML ديناميكية متوافقة مع معيار EN 16931 Factur-X / ZUGFeRD"""
     if not issue_date:
         issue_date = datetime.utcnow().strftime("%Y%m%d")
 
@@ -95,22 +94,28 @@ def check_trial(data: TrialCheckRequest):
 async def convert_invoice(
     vat_id: str = Form(...),
     invoice_number: Optional[str] = Form("INV-2026-001"),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(None)
 ):
     vat_hash = hash_vat_id(vat_id)
     
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Invalid file type. Only PDF files are supported.")
     
-    # فحص التجربة المجانية عبر Supabase
-    if supabase:
+    # التحقق من مفتاح الـ API المدفوع
+    is_paid_user = (x_api_key and x_api_key == MASTER_API_KEY)
+    
+    # إذا لم يكن مشتركاً مدفوعاً، يتم تطبيق فحص التجربة المجانية
+    if not is_paid_user and supabase:
         check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
         if check_res.data:
-            raise HTTPException(status_code=403, detail="This VAT ID has already used its free trial.")
+            raise HTTPException(
+                status_code=403, 
+                detail="This VAT ID has used its free trial. Please provide a valid X-API-KEY to upgrade."
+            )
 
     pdf_bytes = await file.read()
     
-    # التحقق من سلامة ملف الـ PDF وقابليته للقراءة
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
@@ -124,7 +129,6 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="Corrupted or invalid PDF structure.")
 
-    # تسليط الـ XML وتحديث السجل
     xml_data = generate_dynamic_zugferd_xml(vat_id=vat_id, invoice_number=invoice_number)
     writer.add_attachment("factur-x.xml", xml_data)
 
@@ -132,8 +136,8 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # تسجيل القيمة في Supabase فقط بعد التأكد من صحة التحويل
-    if supabase:
+    # التسجيل في قائمة المجانيين فقط إن لم يكن مشتركاً مدفوعاً
+    if not is_paid_user and supabase:
         supabase.table("used_trials").insert({"vat_id_hash": vat_hash}).execute()
 
     return Response(
