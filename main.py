@@ -20,7 +20,6 @@ class TrialCheckRequest(BaseModel):
     vat_id: str
 
 def hash_vat_id(vat_id: str) -> str:
-    """تشفير الرقم الضريبي باستخدامه مع Salt لضمان عدم إمكانية فك التشفير"""
     clean_vat = vat_id.strip().upper()
     salted_string = f"{clean_vat}:{HASH_SALT}"
     return hashlib.sha256(salted_string.encode('utf-8')).hexdigest()
@@ -70,7 +69,6 @@ async def convert_invoice(vat_id: str = Form(...), file: UploadFile = File(...))
         if check_res.data:
             raise HTTPException(status_code=403, detail="This VAT ID has already used its free trial.")
         
-        # تخزين الـ Hash فقط بدلاً من الرقم الضريبي الصريح
         supabase.table("used_trials").insert({"vat_id_hash": vat_hash}).execute()
 
     pdf_bytes = await file.read()
