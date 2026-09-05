@@ -58,9 +58,8 @@ async def convert_invoice(file: UploadFile = File(...)):
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=converted_{file.filename}"}
     )
-    from fastapi import FastAPI, File, UploadFile, Response
+from fastapi import File, UploadFile, Response
 
-# إذا كان متغير التطبيق لديك باسم app
 @app.post("/convert")
 async def convert_invoice(file: UploadFile = File(...)):
     content = await file.read()
