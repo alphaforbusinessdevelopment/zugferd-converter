@@ -1,5 +1,6 @@
 import os
 import io
+import math
 import hashlib
 from datetime import datetime
 from typing import Optional
@@ -10,11 +11,10 @@ from supabase import create_client, Client
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X Converter API",
-    description="GDPR-compliant Zero Data Retention E-Invoice Generation Engine",
-    version="1.0.0"
+    description="GDPR-compliant Zero Data Retention Engine with Smart Metering & Referrals",
+    version="1.1.0"
 )
 
-# البيئة والمتغيرات
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
@@ -27,17 +27,19 @@ if SUPABASE_URL and SUPABASE_KEY:
 class TrialCheckRequest(BaseModel):
     vat_id: str
 
-def hash_vat_id(vat_id: str) -> str:
-    clean_vat = vat_id.strip().upper()
-    salted_string = f"{clean_vat}:{HASH_SALT}"
+def hash_string(value: str) -> str:
+    clean_val = value.strip()
+    salted_string = f"{clean_val}:{HASH_SALT}"
     return hashlib.sha256(salted_string.encode('utf-8')).hexdigest()
+
+def calculate_required_credits(page_count: int) -> int:
+    """كل 3 صفحات تشكل فاتورة واحدة (1-3 = 1 credit, 4-6 = 2 credits)"""
+    return math.ceil(page_count / 3.0)
 
 def generate_dynamic_zugferd_xml(
     vat_id: str,
     invoice_number: str = "INV-2026-001",
-    issue_date: Optional[str] = None,
-    seller_name: str = "Supplier Company",
-    buyer_name: str = "Client Company"
+    issue_date: Optional[str] = None
 ) -> bytes:
     if not issue_date:
         issue_date = datetime.utcnow().strftime("%Y%m%d")
@@ -61,14 +63,10 @@ def generate_dynamic_zugferd_xml(
   <rsm:SupplyChainTradeTransaction>
     <ram:ApplicableHeaderTradeAgreement>
       <ram:SellerTradeParty>
-        <ram:Name>{seller_name}</ram:Name>
         <ram:SpecifiedTaxRegistration>
           <ram:ID schemeID="VA">{vat_id.strip().upper()}</ram:ID>
         </ram:SpecifiedTaxRegistration>
       </ram:SellerTradeParty>
-      <ram:BuyerTradeParty>
-        <ram:Name>{buyer_name}</ram:Name>
-      </ram:BuyerTradeParty>
     </ram:ApplicableHeaderTradeAgreement>
   </rsm:SupplyChainTradeTransaction>
 </rsm:CrossIndustryInvoice>"""
@@ -76,19 +74,7 @@ def generate_dynamic_zugferd_xml(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "ZUGFeRD Engine", "gdpr_mode": "Zero Data Retention"}
-
-@app.post("/check-trial")
-def check_trial(data: TrialCheckRequest):
-    vat_hash = hash_vat_id(data.vat_id)
-    if not supabase:
-        return {"allowed": True, "message": "Trial mode active (Database bypass)."}
-    
-    response = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
-    if response.data:
-        return {"allowed": False, "message": "This VAT ID has already used its free trial."}
-    
-    return {"allowed": True, "message": "VAT ID eligible for free trial."}
+    return {"status": "ok", "service": "ZUGFeRD Engine", "version": "1.1.0"}
 
 @app.post("/convert")
 async def convert_invoice(
@@ -97,29 +83,20 @@ async def convert_invoice(
     file: UploadFile = File(...),
     x_api_key: Optional[str] = Header(None)
 ):
-    vat_hash = hash_vat_id(vat_id)
+    vat_hash = hash_string(vat_id.strip().upper())
     
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Invalid file type. Only PDF files are supported.")
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
     
-    # التحقق من مفتاح الـ API المدفوع
-    is_paid_user = (x_api_key and x_api_key == MASTER_API_KEY)
-    
-    # إذا لم يكن مشتركاً مدفوعاً، يتم تطبيق فحص التجربة المجانية
-    if not is_paid_user and supabase:
-        check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
-        if check_res.data:
-            raise HTTPException(
-                status_code=403, 
-                detail="This VAT ID has used its free trial. Please provide a valid X-API-KEY to upgrade."
-            )
-
     pdf_bytes = await file.read()
     
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
-            raise HTTPException(status_code=400, detail="Encrypted or password-protected PDFs are not supported.")
+            raise HTTPException(status_code=400, detail="Encrypted PDFs are not supported.")
+        
+        page_count = len(reader.pages)
+        required_credits = calculate_required_credits(page_count)
         
         writer = PdfWriter()
         for page in reader.pages:
@@ -127,8 +104,38 @@ async def convert_invoice(
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
-        raise HTTPException(status_code=400, detail="Corrupted or invalid PDF structure.")
+        raise HTTPException(status_code=400, detail="Corrupted PDF file.")
 
+    # 1. التحقق من مفتاح الـ Master Admin
+    is_master = (x_api_key and x_api_key == MASTER_API_KEY)
+    
+    key_data = None
+    if not is_master and x_api_key and supabase:
+        key_hash = hash_string(x_api_key)
+        res = supabase.table("api_keys").select("*").eq("key_hash", key_hash).eq("is_active", True).execute()
+        if res.data:
+            key_data = res.data[0]
+
+    # 2. فحص الرصيد والحظر
+    if not is_master:
+        if key_data:
+            # مشترك مدفوع: التأكد من وجود رصيد كافٍ بناءً على عدد الصفحات
+            current_credits = key_data.get("credits", 0)
+            if current_credits < required_credits:
+                raise HTTPException(
+                    status_code=402, 
+                    detail=f"Insufficient credits. This {page_count}-page document requires {required_credits} credits."
+                )
+        elif supabase:
+            # تجريبي: فحص الاستخدام السابق
+            check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
+            if check_res.data:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="This VAT ID has used its free trial. Please upgrade with an API Key."
+                )
+
+    # 3. إلحاق الـ XML
     xml_data = generate_dynamic_zugferd_xml(vat_id=vat_id, invoice_number=invoice_number)
     writer.add_attachment("factur-x.xml", xml_data)
 
@@ -136,9 +143,15 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # التسجيل في قائمة المجانيين فقط إن لم يكن مشتركاً مدفوعاً
-    if not is_paid_user and supabase:
-        supabase.table("used_trials").insert({"vat_id_hash": vat_hash}).execute()
+    # 4. الخصم وتحديث السجل
+    if not is_master and supabase:
+        if key_data:
+            # خصم النقاط المستحقة حسب عدد الصفحات
+            new_credits = key_data["credits"] - required_credits
+            supabase.table("api_keys").update({"credits": new_credits}).eq("id", key_data["id"]).execute()
+        else:
+            # تسجيل الاستخدام المجاني
+            supabase.table("used_trials").insert({"vat_id_hash": vat_hash}).execute()
 
     return Response(
         content=output_stream.getvalue(),
