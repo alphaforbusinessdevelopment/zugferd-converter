@@ -1,5 +1,6 @@
 import os
 import io
+import hashlib
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form
 from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter
@@ -9,6 +10,7 @@ app = FastAPI(title="ZUGFeRD Converter API")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -17,17 +19,23 @@ if SUPABASE_URL and SUPABASE_KEY:
 class TrialCheckRequest(BaseModel):
     vat_id: str
 
+def hash_vat_id(vat_id: str) -> str:
+    """تشفير الرقم الضريبي باستخدامه مع Salt لضمان عدم إمكانية فك التشفير"""
+    clean_vat = vat_id.strip().upper()
+    salted_string = f"{clean_vat}:{HASH_SALT}"
+    return hashlib.sha256(salted_string.encode('utf-8')).hexdigest()
+
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "ZUGFeRD Converter API is running"}
 
 @app.post("/check-trial")
 def check_trial(data: TrialCheckRequest):
-    vat = data.vat_id.strip().upper()
+    vat_hash = hash_vat_id(data.vat_id)
     if not supabase:
         return {"allowed": True, "message": "Trial mode active (Database bypass)."}
     
-    response = supabase.table("used_trials").select("*").eq("vat_id_hash", vat).execute()
+    response = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
     if response.data:
         return {"allowed": False, "message": "This VAT ID has already used its free trial."}
     
@@ -52,17 +60,18 @@ def generate_zugferd_xml(vat_id: str = "DE123456789") -> bytes:
 
 @app.post("/convert")
 async def convert_invoice(vat_id: str = Form(...), file: UploadFile = File(...)):
-    vat = vat_id.strip().upper()
+    vat_hash = hash_vat_id(vat_id)
     
-    if not file.filename.endswith('.pdf'):
+    if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     
     if supabase:
-        check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat).execute()
+        check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
         if check_res.data:
             raise HTTPException(status_code=403, detail="This VAT ID has already used its free trial.")
         
-        supabase.table("used_trials").insert({"vat_id_hash": vat}).execute()
+        # تخزين الـ Hash فقط بدلاً من الرقم الضريبي الصريح
+        supabase.table("used_trials").insert({"vat_id_hash": vat_hash}).execute()
 
     pdf_bytes = await file.read()
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -71,7 +80,7 @@ async def convert_invoice(vat_id: str = Form(...), file: UploadFile = File(...))
     for page in reader.pages:
         writer.add_page(page)
 
-    xml_data = generate_zugferd_xml(vat_id=vat)
+    xml_data = generate_zugferd_xml(vat_id=vat_id)
     writer.add_attachment("factur-x.xml", xml_data)
 
     output_stream = io.BytesIO()
