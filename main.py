@@ -308,3 +308,72 @@ async def convert_invoice(
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=zugferd_{target_country}_{out_name}"}
     )
+    import hashlib
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, status
+
+# ... (باقي الكود والمستوردات الحالية) ...
+
+def verify_and_consume_credit(x_api_key: str = Header(..., description="API Key الخاص بك")):
+    # 1. تشفير المفتاح المدخل للبحث عنه في قاعدة البيانات
+    key_hash = hashlib.sha256(x_api_key.encode()).hexdigest()
+    
+    # 2. البحث عن المفتاح في جدول api_keys
+    res = supabase.table("api_keys").select("*").eq("key_hash", key_hash).execute()
+    
+    if not res.data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="مفتاح الـ API غير صحيح أو غير موجود"
+        )
+        
+    record = res.data[0]
+    
+    # التأكد من أن حساب المفتاح مفعل
+    if not record.get("is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="هذا المفتاح معطل حالياً"
+        )
+        
+    current_credits = record.get("credits", 0)
+    
+    # 3. التأكد من وجود رصيد كافٍ
+    if current_credits <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="رصيدك انتهى. يرجى إعادة الشراء للحصول على نقاط جديدة."
+        )
+        
+    # 4. خصم نقطة واحدة وتحديث Supabase
+    new_credits = current_credits - 1
+    supabase.table("api_keys").update({"credits": new_credits}).eq("key_hash", key_hash).execute()
+    
+    record["credits"] = new_credits
+    return record
+    @app.post("/v1/convert")
+async def convert_pdf_to_zugferd(
+    file: UploadFile = File(...),
+    api_user: dict = Depends(verify_and_consume_credit)
+):
+    # التأكد من أن الملف المرفوع هو PDF
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="نوع الملف غير مدعوم، يرجى رفع ملف PDF فقط."
+        )
+        
+    # قراءة محتوى الملف
+    pdf_bytes = await file.read()
+    
+    # -------------------------------------------------------------
+    # هنا يتم استدعاء محرك تحويل الـ PDF لـ Factur-X / ZUGFeRD
+    # -------------------------------------------------------------
+    
+    return {
+        "status": "success",
+        "message": "تم تحويل الملف بنجاح وخصم نقطة من رصيدك",
+        "filename": file.filename,
+        "remaining_credits": api_user["credits"]
+    }
+    
+        
