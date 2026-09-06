@@ -7,11 +7,13 @@ from typing import Optional, Literal
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header, Request
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
     description="GDPR-compliant Zero Data Retention Engine with Multi-Country Rules, Ingestion Tiers & PDF/A-3 Compliance",
-    version="2.0.2"
+    version="2.1.0"
 )
 
 # متغيرات البيئة
@@ -19,7 +21,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "whsec_default_secret_key")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -32,6 +33,21 @@ def hash_string(value: str) -> str:
 
 def calculate_required_credits(page_count: int) -> int:
     return math.ceil(page_count / 3.0)
+
+def build_blank_invoice_pdf(invoice_number: str, vat_id: str, issue_date: str) -> bytes:
+    """توليد ملف PDF مرئي من الصفر لخيار الإدخال اليدوي (web_form)"""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(100, 750, f"INVOICE: {invoice_number}")
+    c.setFont("Helvetica", 12)
+    c.drawString(100, 720, f"Date: {issue_date}")
+    c.drawString(100, 700, f"VAT ID / Tax Reg: {vat_id}")
+    c.drawString(100, 650, "Generated via ZUGFeRD Web Form Engine")
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 def generate_dynamic_zugferd_xml(
     vat_id: str,
@@ -84,16 +100,15 @@ def generate_dynamic_zugferd_xml(
 def read_root():
     return {
         "status": "ok", 
-        "engine": "ZUGFeRD / Factur-X PDF/A-3 Engine", 
-        "version": "2.0.2",
+        "engine": "ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine", 
+        "version": "2.1.0",
         "supported_countries": ["DE", "FR", "EU"],
         "supported_languages": ["en", "de", "fr"],
-        "ingestion_methods": ["native_pdf", "ocr_scan", "web_form"]
+        "ingestion_methods": ["native_pdf", "ocr_scan", "web_form", "api"]
     }
 
 @app.get("/check-balance")
 def check_balance(x_api_key: str = Header(...)):
-    """فحص رصيد المفتاح الحالي"""
     if x_api_key == MASTER_API_KEY:
         return {"tier": "master", "credits": "unlimited"}
         
@@ -108,30 +123,31 @@ def check_balance(x_api_key: str = Header(...)):
         
     return res.data[0]
 
-@app.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
-    """استقبال إشعارات الشراء التلقائية من Stripe لتحديث الرصيد في Supabase"""
-    # سيتم ربطه بمفتاح السر الخاص بـ Stripe Stripe Secret
-    return {"status": "received"}
-
 @app.post("/convert")
 async def convert_invoice(
     vat_id: str = Form(...),
     invoice_number: Optional[str] = Form("INV-2026-001"),
     target_country: Literal["DE", "FR", "EU"] = Form("DE"),
-    ingestion_method: Literal["native_pdf", "ocr_scan", "web_form"] = Form("native_pdf"),
+    ingestion_method: Literal["native_pdf", "ocr_scan", "web_form", "api"] = Form("native_pdf"),
     siren_siret: Optional[str] = Form(None),
     local_tax_number: Optional[str] = Form(None),
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     x_api_key: Optional[str] = Header(None)
 ):
     vat_hash = hash_string(vat_id.strip().upper())
-    
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-    
-    pdf_bytes = await file.read()
-    
+    today_str = datetime.utcnow().strftime("%Y%m%d")
+
+    # 1. التحقق من طريقة الإدخال وتعيين مصدر الـ PDF
+    if ingestion_method == "web_form":
+        # توليد PDF مرئي تلقائياً من البيانات المرفوعة يدوياً
+        pdf_bytes = build_blank_invoice_pdf(invoice_number, vat_id, today_str)
+    else:
+        if not file:
+            raise HTTPException(status_code=400, detail="File upload is required for this ingestion method.")
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        pdf_bytes = await file.read()
+
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
@@ -147,7 +163,7 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="Corrupted PDF file.")
 
-    # 1. التحقق من مفتاح الـ Master
+    # 2. حوكمة المفاتيح والباقات
     is_master = (x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
     
@@ -157,7 +173,7 @@ async def convert_invoice(
         if res.data:
             key_data = res.data[0]
 
-    # 2. فحص صلاحية طريقة الإدخال
+    # 3. فحص صلاحية طريقة الإدخال والخصم
     if not is_master and key_data:
         if ingestion_method == "ocr_scan" and not key_data.get("allow_ocr", False):
             raise HTTPException(
@@ -165,14 +181,13 @@ async def convert_invoice(
                 detail="OCR processing requires a Pro tier subscription."
             )
 
-    # 3. فحص الرصيد والتجربة المجانية
     if not is_master:
         if key_data:
             current_credits = key_data.get("credits", 0)
             if current_credits < required_credits:
                 raise HTTPException(
                     status_code=402, 
-                    detail=f"Insufficient credits. This {page_count}-page document requires {required_credits} credits."
+                    detail=f"Insufficient credits. Requires {required_credits} credits."
                 )
         elif supabase:
             check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
@@ -182,21 +197,21 @@ async def convert_invoice(
                     detail="This VAT ID has used its free trial. Please upgrade with an API Key."
                 )
 
-    # 4. توليد وإرفاق ملف XML
+    # 4. توليد الـ XML وإرفاقه للـ PDF/A-3b
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
+        issue_date=today_str,
         target_country=target_country,
         siren_siret=siren_siret,
         local_tax_number=local_tax_number
     )
     
     writer.add_attachment("factur-x.xml", xml_data)
-
     writer.add_metadata({
         "/Title": f"Invoice {invoice_number}",
         "/Creator": "ZUGFeRD PDF/A-3 Engine",
-        "/Producer": "FastAPI ZUGFeRD Converter v2.0",
+        "/Producer": "FastAPI ZUGFeRD Converter v2.1",
         "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing"
     })
 
@@ -204,7 +219,7 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # 5. خصم الرصيد أو تسجيل التجربة
+    # 5. خصم الرصيد
     if not is_master and supabase:
         if key_data:
             new_credits = key_data["credits"] - required_credits
@@ -215,8 +230,9 @@ async def convert_invoice(
                 "target_country": target_country
             }).execute()
 
+    out_name = file.filename if file else f"{invoice_number}.pdf"
     return Response(
         content=output_stream.getvalue(),
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=zugferd_{target_country}_{file.filename}"}
+        headers={"Content-Disposition": f"attachment; filename=zugferd_{target_country}_{out_name}"}
     )
