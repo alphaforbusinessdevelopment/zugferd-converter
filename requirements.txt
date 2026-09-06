@@ -4,3 +4,4 @@ supabase
 pydantic
 python-multipart
 pypdf
+resend
