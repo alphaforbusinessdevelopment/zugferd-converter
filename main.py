@@ -1,19 +1,17 @@
 import os
 import io
 import math
-import secrets
 import hashlib
 from datetime import datetime
 from typing import Optional, Literal
-from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header
-from pydantic import BaseModel
+from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header, Request
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
     description="GDPR-compliant Zero Data Retention Engine with Multi-Country Rules, Ingestion Tiers & PDF/A-3 Compliance",
-    version="2.0.1"
+    version="2.0.2"
 )
 
 # متغيرات البيئة
@@ -21,6 +19,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "whsec_default_secret_key")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -86,11 +85,34 @@ def read_root():
     return {
         "status": "ok", 
         "engine": "ZUGFeRD / Factur-X PDF/A-3 Engine", 
-        "version": "2.0.1",
+        "version": "2.0.2",
         "supported_countries": ["DE", "FR", "EU"],
         "supported_languages": ["en", "de", "fr"],
         "ingestion_methods": ["native_pdf", "ocr_scan", "web_form"]
     }
+
+@app.get("/check-balance")
+def check_balance(x_api_key: str = Header(...)):
+    """فحص رصيد المفتاح الحالي"""
+    if x_api_key == MASTER_API_KEY:
+        return {"tier": "master", "credits": "unlimited"}
+        
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection missing.")
+        
+    key_hash = hash_string(x_api_key)
+    res = supabase.table("api_keys").select("credits", "is_active", "allow_ocr").eq("key_hash", key_hash).execute()
+    
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Invalid API Key.")
+        
+    return res.data[0]
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """استقبال إشعارات الشراء التلقائية من Stripe لتحديث الرصيد في Supabase"""
+    # سيتم ربطه بمفتاح السر الخاص بـ Stripe Stripe Secret
+    return {"status": "received"}
 
 @app.post("/convert")
 async def convert_invoice(
@@ -160,7 +182,7 @@ async def convert_invoice(
                     detail="This VAT ID has used its free trial. Please upgrade with an API Key."
                 )
 
-    # 4. توليد وإلحاق الـ XML بالطريقة الرسمية المستقرة
+    # 4. توليد وإرفاق ملف XML
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -170,6 +192,13 @@ async def convert_invoice(
     )
     
     writer.add_attachment("factur-x.xml", xml_data)
+
+    writer.add_metadata({
+        "/Title": f"Invoice {invoice_number}",
+        "/Creator": "ZUGFeRD PDF/A-3 Engine",
+        "/Producer": "FastAPI ZUGFeRD Converter v2.0",
+        "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing"
+    })
 
     output_stream = io.BytesIO()
     writer.write(output_stream)
