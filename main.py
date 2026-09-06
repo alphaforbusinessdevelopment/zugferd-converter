@@ -11,7 +11,7 @@ from supabase import create_client, Client
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
     description="GDPR-compliant Zero Data Retention Engine with Multi-Country Rules, Ingestion Tiers & PDF/A-3 Compliance",
-    version="2.1.1"
+    version="2.2.0"
 )
 
 # متغيرات البيئة
@@ -36,7 +36,6 @@ def calculate_required_credits(page_count: int) -> int:
     return math.ceil(page_count / 3.0)
 
 def generate_blank_pdf() -> bytes:
-    """توليد ملف PDF متوافق وخفيف باستخدام pypdf بأسلوب نقي"""
     writer = PdfWriter()
     writer.add_blank_page(width=612, height=792)
     stream = io.BytesIO()
@@ -96,10 +95,31 @@ def read_root():
     return {
         "status": "ok", 
         "engine": "ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine", 
-        "version": "2.1.1",
+        "version": "2.2.0",
         "supported_countries": ["DE", "FR", "EU"],
         "supported_languages": ["en", "de", "fr"],
         "ingestion_methods": ["native_pdf", "ocr_scan", "web_form", "api"]
+    }
+
+@app.get("/pricing")
+def get_pricing_tiers():
+    """جلب الباقات المعتمدة الرسمية والأسعار ومواصفات الضريبة"""
+    if supabase:
+        try:
+            res = supabase.table("tiers").select("*").execute()
+            if res.data:
+                return {"tiers": res.data}
+        except Exception:
+            pass
+
+    # البيانات المعتمدة طوارئ حسب جدول التسحيح الرسمي
+    return {
+        "tiers": [
+            {"id": "free_trial", "name_ar": "التجربة المجانية", "price_gross_eur": 0.00, "price_net_eur": 0.00, "vat_eur": 0.00, "credits": 1, "allow_excel_api": False},
+            {"id": "single_payg", "name_ar": "تحويل فردي", "price_gross_eur": 2.99, "price_net_eur": 2.51, "vat_eur": 0.48, "credits": 1, "allow_excel_api": False},
+            {"id": "freelancer", "name_ar": "باقة المستقلين", "price_gross_eur": 12.00, "price_net_eur": 10.08, "vat_eur": 1.92, "credits": 10, "allow_excel_api": False},
+            {"id": "business", "name_ar": "باقة الشركات", "price_gross_eur": 35.00, "price_net_eur": 29.41, "vat_eur": 5.59, "credits": 100, "allow_excel_api": True}
+        ]
     }
 
 @app.get("/check-balance")
@@ -111,7 +131,7 @@ def check_balance(x_api_key: str = Header(...)):
         raise HTTPException(status_code=500, detail="Database connection not configured.")
         
     key_hash = hash_string(x_api_key)
-    res = supabase.table("api_keys").select("credits", "is_active", "allow_ocr").eq("key_hash", key_hash).execute()
+    res = supabase.table("api_keys").select("credits", "is_active", "tier_id").eq("key_hash", key_hash).execute()
     
     if not res.data:
         raise HTTPException(status_code=404, detail="Invalid API Key.")
@@ -136,7 +156,6 @@ async def convert_invoice(
     vat_hash = hash_string(vat_id.strip().upper())
     today_str = datetime.utcnow().strftime("%Y%m%d")
 
-    # 1. تحديد الـ PDF حسب طريقة الإدخال
     if ingestion_method == "web_form":
         pdf_bytes = generate_blank_pdf()
     else:
@@ -161,7 +180,6 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="Corrupted PDF file.")
 
-    # 2. فحص الصلاحية والمفاتيح
     is_master = (x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
     
@@ -171,11 +189,12 @@ async def convert_invoice(
         if res.data:
             key_data = res.data[0]
 
+    # فحص صلاحية الربط ومعالجة Excel لطلب الـ API إذا كانت الباقة ليست الشركات
     if not is_master and key_data:
-        if ingestion_method == "ocr_scan" and not key_data.get("allow_ocr", False):
+        if ingestion_method == "api" and key_data.get("tier_id") != "business":
             raise HTTPException(
                 status_code=403, 
-                detail="OCR processing requires a Pro tier subscription."
+                detail="Direct API integration requires the Business Pack subscription."
             )
 
     if not is_master:
@@ -192,12 +211,11 @@ async def convert_invoice(
                 if check_res.data:
                     raise HTTPException(
                         status_code=403, 
-                        detail="This VAT ID has used its free trial. Please upgrade with an API Key."
+                        detail="This VAT ID has used its free trial (1 invoice). Please purchase a pack to continue."
                     )
             except Exception:
                 pass
 
-    # 3. إرفاق الـ XML والميتا داتا
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -211,7 +229,7 @@ async def convert_invoice(
     writer.add_metadata({
         "/Title": f"Invoice {invoice_number}",
         "/Creator": "ZUGFeRD PDF/A-3 Engine",
-        "/Producer": "FastAPI ZUGFeRD Converter v2.1",
+        "/Producer": "FastAPI ZUGFeRD Converter v2.2",
         "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing"
     })
 
@@ -219,7 +237,6 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # 4. خصم الرصيد
     if not is_master and supabase:
         try:
             if key_data:
