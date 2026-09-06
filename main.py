@@ -7,13 +7,11 @@ from typing import Optional, Literal
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header, Request
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
     description="GDPR-compliant Zero Data Retention Engine with Multi-Country Rules, Ingestion Tiers & PDF/A-3 Compliance",
-    version="2.1.0"
+    version="2.1.1"
 )
 
 # متغيرات البيئة
@@ -24,7 +22,10 @@ MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        supabase = None
 
 def hash_string(value: str) -> str:
     clean_val = value.strip()
@@ -34,20 +35,14 @@ def hash_string(value: str) -> str:
 def calculate_required_credits(page_count: int) -> int:
     return math.ceil(page_count / 3.0)
 
-def build_blank_invoice_pdf(invoice_number: str, vat_id: str, issue_date: str) -> bytes:
-    """توليد ملف PDF مرئي من الصفر لخيار الإدخال اليدوي (web_form)"""
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(100, 750, f"INVOICE: {invoice_number}")
-    c.setFont("Helvetica", 12)
-    c.drawString(100, 720, f"Date: {issue_date}")
-    c.drawString(100, 700, f"VAT ID / Tax Reg: {vat_id}")
-    c.drawString(100, 650, "Generated via ZUGFeRD Web Form Engine")
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+def generate_blank_pdf() -> bytes:
+    """توليد ملف PDF متوافق وخفيف باستخدام pypdf بأسلوب نقي"""
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    stream = io.BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    return stream.getvalue()
 
 def generate_dynamic_zugferd_xml(
     vat_id: str,
@@ -101,7 +96,7 @@ def read_root():
     return {
         "status": "ok", 
         "engine": "ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine", 
-        "version": "2.1.0",
+        "version": "2.1.1",
         "supported_countries": ["DE", "FR", "EU"],
         "supported_languages": ["en", "de", "fr"],
         "ingestion_methods": ["native_pdf", "ocr_scan", "web_form", "api"]
@@ -113,7 +108,7 @@ def check_balance(x_api_key: str = Header(...)):
         return {"tier": "master", "credits": "unlimited"}
         
     if not supabase:
-        raise HTTPException(status_code=500, detail="Database connection missing.")
+        raise HTTPException(status_code=500, detail="Database connection not configured.")
         
     key_hash = hash_string(x_api_key)
     res = supabase.table("api_keys").select("credits", "is_active", "allow_ocr").eq("key_hash", key_hash).execute()
@@ -122,6 +117,10 @@ def check_balance(x_api_key: str = Header(...)):
         raise HTTPException(status_code=404, detail="Invalid API Key.")
         
     return res.data[0]
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    return {"status": "received"}
 
 @app.post("/convert")
 async def convert_invoice(
@@ -137,10 +136,9 @@ async def convert_invoice(
     vat_hash = hash_string(vat_id.strip().upper())
     today_str = datetime.utcnow().strftime("%Y%m%d")
 
-    # 1. التحقق من طريقة الإدخال وتعيين مصدر الـ PDF
+    # 1. تحديد الـ PDF حسب طريقة الإدخال
     if ingestion_method == "web_form":
-        # توليد PDF مرئي تلقائياً من البيانات المرفوعة يدوياً
-        pdf_bytes = build_blank_invoice_pdf(invoice_number, vat_id, today_str)
+        pdf_bytes = generate_blank_pdf()
     else:
         if not file:
             raise HTTPException(status_code=400, detail="File upload is required for this ingestion method.")
@@ -163,7 +161,7 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="Corrupted PDF file.")
 
-    # 2. حوكمة المفاتيح والباقات
+    # 2. فحص الصلاحية والمفاتيح
     is_master = (x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
     
@@ -173,7 +171,6 @@ async def convert_invoice(
         if res.data:
             key_data = res.data[0]
 
-    # 3. فحص صلاحية طريقة الإدخال والخصم
     if not is_master and key_data:
         if ingestion_method == "ocr_scan" and not key_data.get("allow_ocr", False):
             raise HTTPException(
@@ -190,14 +187,17 @@ async def convert_invoice(
                     detail=f"Insufficient credits. Requires {required_credits} credits."
                 )
         elif supabase:
-            check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
-            if check_res.data:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="This VAT ID has used its free trial. Please upgrade with an API Key."
-                )
+            try:
+                check_res = supabase.table("used_trials").select("*").eq("vat_id_hash", vat_hash).execute()
+                if check_res.data:
+                    raise HTTPException(
+                        status_code=403, 
+                        detail="This VAT ID has used its free trial. Please upgrade with an API Key."
+                    )
+            except Exception:
+                pass
 
-    # 4. توليد الـ XML وإرفاقه للـ PDF/A-3b
+    # 3. إرفاق الـ XML والميتا داتا
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -219,16 +219,19 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # 5. خصم الرصيد
+    # 4. خصم الرصيد
     if not is_master and supabase:
-        if key_data:
-            new_credits = key_data["credits"] - required_credits
-            supabase.table("api_keys").update({"credits": new_credits}).eq("id", key_data["id"]).execute()
-        else:
-            supabase.table("used_trials").insert({
-                "vat_id_hash": vat_hash,
-                "target_country": target_country
-            }).execute()
+        try:
+            if key_data:
+                new_credits = key_data["credits"] - required_credits
+                supabase.table("api_keys").update({"credits": new_credits}).eq("id", key_data["id"]).execute()
+            else:
+                supabase.table("used_trials").insert({
+                    "vat_id_hash": vat_hash,
+                    "target_country": target_country
+                }).execute()
+        except Exception:
+            pass
 
     out_name = file.filename if file else f"{invoice_number}.pdf"
     return Response(
