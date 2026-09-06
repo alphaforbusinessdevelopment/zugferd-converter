@@ -8,6 +8,7 @@ from typing import Optional, Literal
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header, Request
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
+import resend
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
@@ -20,6 +21,11 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+
+# ضبط مفتاح Resend
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -158,14 +164,34 @@ async def stripe_webhook(request: Request):
         raw_key = f"sk_live_{secrets.token_urlsafe(24)}"
         key_hash = hash_string(raw_key)
 
+        # 1. حفظ البيانات في Supabase
         if supabase:
             supabase.table("api_keys").insert({
                 "key_hash": key_hash,
                 "credits": credits,
                 "tier_id": tier_id,
                 "is_active": True,
-                "owner_email": customer_email
+                "user_email": customer_email
             }).execute()
+
+        # 2. إرسال المفتاح عبر Resend إلى بريد العميل
+        if customer_email and RESEND_API_KEY:
+            try:
+                resend.Emails.send({
+                    "from": "onboarding@resend.dev",
+                    "to": customer_email,
+                    "subject": "Your API Key - ZUGFeRD Converter",
+                    "html": f"""
+                    <h2>Thank you for your purchase!</h2>
+                    <p>Here is your API Key to access the service:</p>
+                    <p style="font-size: 18px; font-weight: bold; background: #f4f4f4; padding: 10px; border-radius: 5px;">
+                        {raw_key}
+                    </p>
+                    <p>Total Credits: <strong>{credits}</strong></p>
+                    """
+                })
+            except Exception as e:
+                print(f"Resend error: {e}")
 
     return {"status": "success"}
 
