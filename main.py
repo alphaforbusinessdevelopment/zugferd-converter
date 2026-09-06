@@ -8,27 +8,18 @@ from typing import Optional, Literal
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Form, Header, Request
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client, Client
-import stripe
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
     description="GDPR-compliant Zero Data Retention Engine with Multi-Country Rules, Ingestion Tiers & PDF/A-3 Compliance",
-    version="2.3.0"
+    version="2.3.1"
 )
 
-# ---------------------------------------------------------
-# 1. إعدادات بيئة العمل والمتغيرات الأساسية
-# ---------------------------------------------------------
+# متغيرات البيئة الأساسية
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
-
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -37,9 +28,6 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception:
         supabase = None
 
-# ---------------------------------------------------------
-# 2. الدوال المساعدة (Helper Functions)
-# ---------------------------------------------------------
 def hash_string(value: str) -> str:
     clean_val = value.strip()
     salted_string = f"{clean_val}:{HASH_SALT}"
@@ -49,7 +37,6 @@ def calculate_required_credits(page_count: int) -> int:
     return math.ceil(page_count / 3.0)
 
 def generate_blank_pdf() -> bytes:
-    """توليد ملف PDF نقي خفيف للإدخال اليدوي عبر Web Form بدون مكتبات خارجية قد تكسر البيئة"""
     writer = PdfWriter()
     writer.add_blank_page(width=612, height=792)
     stream = io.BytesIO()
@@ -65,14 +52,12 @@ def generate_dynamic_zugferd_xml(
     siren_siret: Optional[str] = None,
     local_tax_number: Optional[str] = None
 ) -> bytes:
-    """توليد هيكل XML متوافق مع معايير EN 16931 وقواعد ألمانيا وفرنسا"""
     if not issue_date:
         issue_date = datetime.utcnow().strftime("%Y%m%d")
 
     country_code = target_country.upper()
     tax_registration_node = f'<ram:ID schemeID="VA">{vat_id.strip().upper()}</ram:ID>'
     
-    # القواعد الفنية الخاصة بكل دولة (Germany FC vs France 0002)
     if country_code == "FR" and siren_siret:
         tax_registration_node += f'\n        <ram:ID schemeID="0002">{siren_siret.strip()}</ram:ID>'
     elif country_code == "DE" and local_tax_number:
@@ -106,16 +91,12 @@ def generate_dynamic_zugferd_xml(
 </rsm:CrossIndustryInvoice>"""
     return xml_content.encode('utf-8')
 
-# ---------------------------------------------------------
-# 3. نقاط النهاية للخدمة (API Endpoints)
-# ---------------------------------------------------------
-
 @app.get("/")
 def read_root():
     return {
         "status": "ok", 
         "engine": "ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine", 
-        "version": "2.3.0",
+        "version": "2.3.1",
         "supported_countries": ["DE", "FR", "EU"],
         "supported_languages": ["en", "de", "fr"],
         "ingestion_methods": ["native_pdf", "ocr_scan", "web_form", "api"]
@@ -123,16 +104,6 @@ def read_root():
 
 @app.get("/pricing")
 def get_pricing_tiers():
-    """عرض الباقات الرسمية المطابقة لجدول التسعير المعتمد (شامل ضريبة 19%)"""
-    if supabase:
-        try:
-            res = supabase.table("tiers").select("*").execute()
-            if res.data:
-                return {"tiers": res.data}
-        except Exception:
-            pass
-
-    # القيم الاحتياطية المطابقة تماماً لجدول التسعير الرسمي
     return {
         "tiers": [
             {"id": "free_trial", "name_ar": "التجربة المجانية", "price_gross_eur": 0.00, "price_net_eur": 0.00, "vat_eur": 0.00, "credits": 1, "allow_excel_api": False},
@@ -144,7 +115,6 @@ def get_pricing_tiers():
 
 @app.get("/check-balance")
 def check_balance(x_api_key: str = Header(...)):
-    """فحص رصيد المفتاح والصلاحيات"""
     if x_api_key == MASTER_API_KEY:
         return {"tier": "master", "credits": "unlimited"}
         
@@ -161,40 +131,30 @@ def check_balance(x_api_key: str = Header(...)):
 
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    """استقبال إشعارات الدفع من Stripe وتوليد المفاتيح ورصيد الفواتير تلقائياً"""
-    if not STRIPE_WEBHOOK_SECRET:
-        return {"status": "ignored", "reason": "Webhook secret not configured"}
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook Error: {str(e)}")
+        body = await request.json()
+    except Exception:
+        return {"status": "error", "detail": "Invalid JSON"}
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
+    event_type = body.get("type")
+    if event_type == "checkout.session.completed":
+        session = body.get("data", {}).get("object", {})
         customer_email = session.get("customer_details", {}).get("email")
-        amount_total = session.get("amount_total", 0)  # المبلغ بالسنت
+        amount_total = session.get("amount_total", 0)
 
-        # مطابقة المبلغ المخصوم بالباقة المستحقة
         tier_id = "single_payg"
         credits = 1
         
-        if amount_total >= 3500:      # باقة الشركات (35.00 EUR)
+        if amount_total >= 3500:
             tier_id = "business"
             credits = 100
-        elif amount_total >= 1200:    # باقة المستقلين (12.00 EUR)
+        elif amount_total >= 1200:
             tier_id = "freelancer"
             credits = 10
-        elif amount_total >= 299:     # تحويل فردي (2.99 EUR)
+        elif amount_total >= 299:
             tier_id = "single_payg"
             credits = 1
 
-        # توليد وحفظ مفتاح API المشفر في Supabase
         raw_key = f"sk_live_{secrets.token_urlsafe(24)}"
         key_hash = hash_string(raw_key)
 
@@ -220,11 +180,9 @@ async def convert_invoice(
     file: Optional[UploadFile] = File(None),
     x_api_key: Optional[str] = Header(None)
 ):
-    """المحرك الرئيسي لتحويل الفواتير وتطبيق الحوكمة وإرفاق الـ XML"""
     vat_hash = hash_string(vat_id.strip().upper())
     today_str = datetime.utcnow().strftime("%Y%m%d")
 
-    # 1. تحديد معالجة المستند بناءً على طريقة الإدخال المختارة
     if ingestion_method == "web_form":
         pdf_bytes = generate_blank_pdf()
     else:
@@ -249,7 +207,6 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="Corrupted PDF file.")
 
-    # 2. حوكمة المفاتيح والتأكد من الصلاحيات والاشتراك
     is_master = (x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
     
@@ -259,7 +216,6 @@ async def convert_invoice(
         if res.data:
             key_data = res.data[0]
 
-    # حصر الربط المباشر بـ API لباقة الشركات فقط
     if not is_master and key_data:
         if ingestion_method == "api" and key_data.get("tier_id") != "business":
             raise HTTPException(
@@ -267,7 +223,6 @@ async def convert_invoice(
                 detail="Direct API integration requires the Business Pack subscription."
             )
 
-    # 3. فحص خصم الرصيد أو التجربة المجانية (فاتورة واحدة)
     if not is_master:
         if key_data:
             current_credits = key_data.get("credits", 0)
@@ -287,7 +242,6 @@ async def convert_invoice(
             except Exception:
                 pass
 
-    # 4. توليد الـ XML وإرفاقه للـ PDF وتطبيق ميتا داتا الـ PDF/A-3b
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -301,7 +255,7 @@ async def convert_invoice(
     writer.add_metadata({
         "/Title": f"Invoice {invoice_number}",
         "/Creator": "ZUGFeRD PDF/A-3 Engine",
-        "/Producer": "FastAPI ZUGFeRD Converter v2.3",
+        "/Producer": "FastAPI ZUGFeRD Converter v2.3.1",
         "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing"
     })
 
@@ -309,7 +263,6 @@ async def convert_invoice(
     writer.write(output_stream)
     output_stream.seek(0)
 
-    # 5. خصم الرصيد أو تسجيل استهلاك التجربة المجانية
     if not is_master and supabase:
         try:
             if key_data:
