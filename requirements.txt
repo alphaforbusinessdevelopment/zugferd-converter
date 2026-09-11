@@ -5,3 +5,6 @@ pydantic
 python-multipart
 pypdf
 resend
+factur-x
+openai
+python-multipart
