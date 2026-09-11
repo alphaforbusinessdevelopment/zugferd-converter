@@ -7,4 +7,3 @@ pypdf
 resend
 factur-x
 openai
-python-multipart
