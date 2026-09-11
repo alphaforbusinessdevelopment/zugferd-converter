@@ -1,10 +1,12 @@
 import hashlib
 import io
+import json
 import math
 import os
 import secrets
 from datetime import datetime
 from typing import Literal, Optional
+
 from fastapi import (
     Depends,
     FastAPI,
@@ -17,9 +19,12 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pypdf import PdfReader, PdfWriter
 import resend
 from supabase import Client, create_client
+import facturx
 
 app = FastAPI(
     title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
@@ -30,14 +35,27 @@ app = FastAPI(
     version="2.3.1",
 )
 
-# متغيرات البيئة الأساسية
+# ---------------------------------------------------------
+# 1. إعدادات CORS للسماح بالاتصال من الواجهات الأمامية
+# ---------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------
+# 2. متغيرات البيئة والخدمات الخارجية
+# ---------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 HASH_SALT = os.getenv("HASH_SALT", "default_secure_salt_2026")
 MASTER_API_KEY = os.getenv("MASTER_API_KEY", "sk_live_master_key_2026")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# ضبط مفتاح Resend
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
@@ -48,7 +66,16 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception:
         supabase = None
 
+openai_client: Optional[OpenAI] = None
+if OPENAI_API_KEY:
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        openai_client = None
 
+# ---------------------------------------------------------
+# 3. الدوال المساعدة (Helper Functions)
+# ---------------------------------------------------------
 def hash_string(value: str) -> str:
     clean_val = value.strip()
     salted_string = f"{clean_val}:{HASH_SALT}"
@@ -66,6 +93,45 @@ def generate_blank_pdf() -> bytes:
     writer.write(stream)
     stream.seek(0)
     return stream.getvalue()
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """استخراج النصوص من صفحات ملف PDF"""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
+    except Exception:
+        return ""
+
+
+def extract_invoice_data_with_ai(text_content: str) -> dict:
+    """استخراج بيانات الفاتورة تلقائياً باستخدام OpenAI"""
+    if not openai_client or not text_content.strip():
+        return {}
+    try:
+        prompt = f"""
+        Extract key invoice fields from the following text into strict JSON format:
+        - vat_id: string or null (Supplier/Seller VAT number)
+        - invoice_number: string (default "INV-2026-001" if missing)
+        - target_country: "DE", "FR", or "EU"
+        - siren_siret: string or null (if French company)
+        - local_tax_number: string or null (if German Steuernummer)
+
+        Invoice Text:
+        {text_content[:3500]}
+        """
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception:
+        return {}
 
 
 def generate_dynamic_zugferd_xml(
@@ -171,7 +237,9 @@ def verify_and_consume_credit(
     record["credits"] = new_credits
     return record
 
-
+# ---------------------------------------------------------
+# 4. نقاط النهاية العامة (API Endpoints)
+# ---------------------------------------------------------
 @app.get("/")
 def read_root():
     return {
@@ -260,9 +328,9 @@ async def stripe_webhook(request: Request):
         return {"status": "error", "detail": "Invalid JSON"}
 
     event_type = body.get("type")
-    if event_type == "checkout.session.completed":
+    if event_type in ["checkout.session.completed", "order_created"]:
         session = body.get("data", {}).get("object", {})
-        customer_email = session.get("customer_details", {}).get("email")
+        customer_email = session.get("customer_details", {}).get("email") or body.get("data", {}).get("attributes", {}).get("user_email")
         amount_total = session.get("amount_total", 0)
 
         tier_id = "single_payg"
@@ -313,7 +381,7 @@ async def stripe_webhook(request: Request):
 
 @app.post("/convert")
 async def convert_invoice(
-    vat_id: str = Form(...),
+    vat_id: Optional[str] = Form(None),
     invoice_number: Optional[str] = Form("INV-2026-001"),
     target_country: Literal["DE", "FR", "EU"] = Form("DE"),
     ingestion_method: Literal[
@@ -324,40 +392,54 @@ async def convert_invoice(
     file: Optional[UploadFile] = File(None),
     x_api_key: Optional[str] = Header(None),
 ):
-    vat_hash = hash_string(vat_id.strip().upper())
     today_str = datetime.utcnow().strftime("%Y%m%d")
 
+    # 1. جلب محتوى ملف الـ PDF
     if ingestion_method == "web_form":
         pdf_bytes = generate_blank_pdf()
     else:
         if not file:
             raise HTTPException(
                 status_code=400,
-                detail="File upload is required for this ingestion method.",
+                detail="يرجى رفع ملف PDF للتحويل.",
             )
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(
-                status_code=400, detail="Only PDF files are supported."
+                status_code=400, detail="الصيغ المدعومة هي PDF فقط."
             )
         pdf_bytes = await file.read()
 
+    # 2. الاستخراج الآلي عبر الذكاء الاصطناعي في حالة عدم إدخال الرقم الضريبي يدوياً
+    if not vat_id and file:
+        extracted_text = extract_text_from_pdf(pdf_bytes)
+        ai_data = extract_invoice_data_with_ai(extracted_text)
+        vat_id = ai_data.get("vat_id")
+        invoice_number = ai_data.get("invoice_number", invoice_number)
+        target_country = ai_data.get("target_country", target_country)
+        siren_siret = ai_data.get("siren_siret", siren_siret)
+        local_tax_number = ai_data.get("local_tax_number", local_tax_number)
+
+    if not vat_id:
+        vat_id = "DE999999999"  # رقم افتراضي في حالة تعذر الاستخراج
+
+    vat_hash = hash_string(vat_id.strip().upper())
+
+    # 3. التحقق من صحة الملف وعدد الصفحات
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
             raise HTTPException(
-                status_code=400, detail="Encrypted PDFs are not supported."
+                status_code=400, detail="الملفات المشفرة غير مدعومة."
             )
 
         page_count = len(reader.pages)
         required_credits = calculate_required_credits(page_count)
-
-        writer = PdfWriter()
-        writer.append(reader)
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
-        raise HTTPException(status_code=400, detail="Corrupted PDF file.")
+        raise HTTPException(status_code=400, detail="ملف PDF غير صالح أو تالف.")
 
+    # 4. فحص الرصيد أو التجربة المجانية
     is_master = bool(x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
 
@@ -377,10 +459,7 @@ async def convert_invoice(
         if ingestion_method == "api" and key_data.get("tier_id") != "business":
             raise HTTPException(
                 status_code=403,
-                detail=(
-                    "Direct API integration requires the Business Pack"
-                    " subscription."
-                ),
+                detail="الربط المباشر عبر API يتطلب باقة الشركات (Business Pack).",
             )
 
     if not is_master:
@@ -389,10 +468,7 @@ async def convert_invoice(
             if current_credits < required_credits:
                 raise HTTPException(
                     status_code=402,
-                    detail=(
-                        f"Insufficient credits. Requires {required_credits}"
-                        " credits."
-                    ),
+                    detail=f"رصيدك غير كافٍ. العملية تتطلب {required_credits} نقاط.",
                 )
         elif supabase:
             try:
@@ -406,13 +482,14 @@ async def convert_invoice(
                     raise HTTPException(
                         status_code=403,
                         detail=(
-                            "This VAT ID has used its free trial (1 invoice)."
-                            " Please purchase a pack to continue."
+                            "تم استخدام التجربة المجانية لهذا الرقم الضريبي من قبل."
+                            " يرجى شراء باقة للمتابعة."
                         ),
                     )
             except Exception:
                 pass
 
+    # 5. توليد XML ودمجه مع ملف الـ PDF المعياري
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -422,18 +499,29 @@ async def convert_invoice(
         local_tax_number=local_tax_number,
     )
 
-    writer.add_attachment("factur-x.xml", xml_data)
-    writer.add_metadata({
-        "/Title": f"Invoice {invoice_number}",
-        "/Creator": "ZUGFeRD PDF/A-3 Engine",
-        "/Producer": "FastAPI ZUGFeRD Converter v2.3.1",
-        "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing",
-    })
+    try:
+        # دمج الـ XML وفق معيار PDF/A-3 عبر Factur-X
+        final_pdf_bytes = facturx.facturx_add_xml_to_pdf_metadata(
+            pdf_bytes,
+            xml_data,
+            facturx_level="basic"
+        )
+    except Exception:
+        # Fallback لدمج المرفق يدوياً عبر pypdf إذا لزم الأمر
+        writer = PdfWriter()
+        writer.append(reader)
+        writer.add_attachment("factur-x.xml", xml_data)
+        writer.add_metadata({
+            "/Title": f"Invoice {invoice_number}",
+            "/Creator": "ZUGFeRD PDF/A-3 Engine",
+            "/Producer": "FastAPI ZUGFeRD Converter v2.3.1",
+            "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing",
+        })
+        output_stream = io.BytesIO()
+        writer.write(output_stream)
+        final_pdf_bytes = output_stream.getvalue()
 
-    output_stream = io.BytesIO()
-    writer.write(output_stream)
-    output_stream.seek(0)
-
+    # 6. تحديث الرصيد أو تسجيل التجربة المجانية
     if not is_master and supabase:
         try:
             if key_data:
@@ -451,7 +539,7 @@ async def convert_invoice(
 
     out_name = file.filename if file else f"{invoice_number}.pdf"
     return Response(
-        content=output_stream.getvalue(),
+        content=final_pdf_bytes,
         media_type="application/pdf",
         headers={
             "Content-Disposition": (
@@ -473,10 +561,33 @@ async def convert_pdf_to_zugferd(
         )
 
     pdf_bytes = await file.read()
+    extracted_text = extract_text_from_pdf(pdf_bytes)
+    ai_data = extract_invoice_data_with_ai(extracted_text)
 
-    return {
-        "status": "success",
-        "message": "تم تحويل الملف بنجاح وخصم نقطة من رصيدك",
-        "filename": file.filename,
-        "remaining_credits": api_user["credits"],
-    }
+    vat_id = ai_data.get("vat_id", "DE999999999")
+    invoice_number = ai_data.get("invoice_number", "INV-2026-001")
+    target_country = ai_data.get("target_country", "DE")
+
+    xml_data = generate_dynamic_zugferd_xml(
+        vat_id=vat_id,
+        invoice_number=invoice_number,
+        target_country=target_country,
+    )
+
+    try:
+        final_pdf_bytes = facturx.facturx_add_xml_to_pdf_metadata(
+            pdf_bytes,
+            xml_data,
+            facturx_level="basic"
+        )
+    except Exception:
+        final_pdf_bytes = pdf_bytes
+
+    return Response(
+        content=final_pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=zugferd_{file.filename}",
+            "X-Remaining-Credits": str(api_user.get("credits", 0))
+        },
+    )
