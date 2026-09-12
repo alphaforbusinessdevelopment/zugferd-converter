@@ -28,10 +28,10 @@ from supabase import Client, create_client
 import facturx
 
 app = FastAPI(
-    title="ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
+    title="Zugify™ Engine",
     description=(
-        "GDPR-compliant Zero Data Retention Engine with Multi-Country Rules,"
-        " Ingestion Tiers & PDF/A-3 Compliance"
+        "Pan-European ZUGFeRD & Factur-X PDF/A-3 Multi-Language Engine "
+        "with GDPR Zero Data Retention Compliance"
     ),
     version="2.3.1",
 )
@@ -366,9 +366,9 @@ async def stripe_webhook(request: Request):
                 resend.Emails.send({
                     "from": "onboarding@resend.dev",
                     "to": customer_email,
-                    "subject": "Your API Key - ZUGFeRD Converter",
+                    "subject": "Your Zugify™ API Key",
                     "html": f"""
-                    <h2>Thank you for your purchase!</h2>
+                    <h2>Thank you for your purchase with Zugify™!</h2>
                     <p>Here is your API Key to access the service:</p>
                     <p style="font-size: 18px; font-weight: bold; background: #f4f4f4; padding: 10px; border-radius: 5px;">
                         {raw_key}
@@ -509,9 +509,9 @@ async def convert_invoice(
         writer.add_attachment("factur-x.xml", xml_data)
         writer.add_metadata({
             "/Title": f"Invoice {invoice_number}",
-            "/Creator": "ZUGFeRD PDF/A-3 Engine",
-            "/Producer": "FastAPI ZUGFeRD Converter v2.3.1",
-            "/Keywords": "ZUGFeRD, Factur-X, EN 16931, E-Invoicing",
+            "/Creator": "Zugify™ PDF/A-3 Engine",
+            "/Producer": "Zugify™ Engine v2.3.1",
+            "/Keywords": "Zugify, ZUGFeRD, Factur-X, EN 16931, E-Invoicing",
         })
         output_stream = io.BytesIO()
         writer.write(output_stream)
@@ -538,7 +538,7 @@ async def convert_invoice(
         media_type="application/pdf",
         headers={
             "Content-Disposition": (
-                f"attachment; filename=zugferd_{target_country}_{out_name}"
+                f"attachment; filename=zugify_{target_country}_{out_name}"
             )
         },
     )
@@ -582,7 +582,7 @@ async def convert_pdf_to_zugferd(
         content=final_pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f"attachment; filename=zugferd_{file.filename}",
+            "Content-Disposition": f"attachment; filename=zugify_{file.filename}",
             "X-Remaining-Credits": str(api_user.get("credits", 0))
         },
     )
