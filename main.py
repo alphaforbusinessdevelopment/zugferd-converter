@@ -20,6 +20,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pypdf import PdfReader, PdfWriter
 import resend
@@ -34,6 +35,8 @@ app = FastAPI(
     ),
     version="2.3.1",
 )
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------
 # 1. إعدادات CORS للسماح بالاتصال من الواجهات الأمامية
@@ -96,7 +99,6 @@ def generate_blank_pdf() -> bytes:
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """استخراج النصوص من صفحات ملف PDF"""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         text = ""
@@ -108,7 +110,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def extract_invoice_data_with_ai(text_content: str) -> dict:
-    """استخراج بيانات الفاتورة تلقائياً باستخدام OpenAI"""
     if not openai_client or not text_content.strip():
         return {}
     try:
@@ -240,16 +241,18 @@ def verify_and_consume_credit(
 # ---------------------------------------------------------
 # 4. نقاط النهاية العامة (API Endpoints)
 # ---------------------------------------------------------
-@app.get("/")
+
+@app.get("/", response_class=HTMLResponse)
 def read_root():
-    return {
-        "status": "ok",
-        "engine": "ZUGFeRD / Factur-X PDF/A-3 Multi-Language Engine",
-        "version": "2.3.1",
-        "supported_countries": ["DE", "FR", "EU"],
-        "supported_languages": ["en", "de", "fr"],
-        "ingestion_methods": ["native_pdf", "ocr_scan", "web_form", "api"],
-    }
+    html_file_path = os.path.join(BASE_DIR, "index.html")
+    try:
+        with open(html_file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return HTMLResponse(
+            content="<h2>خطأ: لم يتم العثور على ملف index.html في المجلد الرئيسي.</h2>",
+            status_code=404
+        )
 
 
 @app.get("/pricing")
@@ -394,7 +397,6 @@ async def convert_invoice(
 ):
     today_str = datetime.utcnow().strftime("%Y%m%d")
 
-    # 1. جلب محتوى ملف الـ PDF
     if ingestion_method == "web_form":
         pdf_bytes = generate_blank_pdf()
     else:
@@ -409,7 +411,6 @@ async def convert_invoice(
             )
         pdf_bytes = await file.read()
 
-    # 2. الاستخراج الآلي عبر الذكاء الاصطناعي في حالة عدم إدخال الرقم الضريبي يدوياً
     if not vat_id and file:
         extracted_text = extract_text_from_pdf(pdf_bytes)
         ai_data = extract_invoice_data_with_ai(extracted_text)
@@ -420,11 +421,10 @@ async def convert_invoice(
         local_tax_number = ai_data.get("local_tax_number", local_tax_number)
 
     if not vat_id:
-        vat_id = "DE999999999"  # رقم افتراضي في حالة تعذر الاستخراج
+        vat_id = "DE999999999"
 
     vat_hash = hash_string(vat_id.strip().upper())
 
-    # 3. التحقق من صحة الملف وعدد الصفحات
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
@@ -439,7 +439,6 @@ async def convert_invoice(
             raise e
         raise HTTPException(status_code=400, detail="ملف PDF غير صالح أو تالف.")
 
-    # 4. فحص الرصيد أو التجربة المجانية
     is_master = bool(x_api_key and x_api_key == MASTER_API_KEY)
     key_data = None
 
@@ -489,7 +488,6 @@ async def convert_invoice(
             except Exception:
                 pass
 
-    # 5. توليد XML ودمجه مع ملف الـ PDF المعياري
     xml_data = generate_dynamic_zugferd_xml(
         vat_id=vat_id,
         invoice_number=invoice_number,
@@ -500,14 +498,12 @@ async def convert_invoice(
     )
 
     try:
-        # دمج الـ XML وفق معيار PDF/A-3 عبر Factur-X
         final_pdf_bytes = facturx.facturx_add_xml_to_pdf_metadata(
             pdf_bytes,
             xml_data,
             facturx_level="basic"
         )
     except Exception:
-        # Fallback لدمج المرفق يدوياً عبر pypdf إذا لزم الأمر
         writer = PdfWriter()
         writer.append(reader)
         writer.add_attachment("factur-x.xml", xml_data)
@@ -521,7 +517,6 @@ async def convert_invoice(
         writer.write(output_stream)
         final_pdf_bytes = output_stream.getvalue()
 
-    # 6. تحديث الرصيد أو تسجيل التجربة المجانية
     if not is_master and supabase:
         try:
             if key_data:
